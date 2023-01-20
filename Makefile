@@ -1111,3 +1111,7 @@ echo-abc-rev:
 
 .PHONY: all top-all abc test install install-abc docs clean mrproper qtcreator coverage vcxsrc mxebin
 .PHONY: config-clean config-clang config-gcc config-gcc-static config-afl-gcc config-gprof config-sudo
+
+hello.so: hello.cc
+	yosys-config --exec --cxx --cxxflags --ldflags -o $@ -shared $^ --ldlibs
+	#yosys-config --exec --cxx --cxxflags --ldflags -o hello.so -shared hello.cc --ldlibs

@@ -45,4 +45,5 @@ OBJS += passes/cmds/logger.o
 OBJS += passes/cmds/printattrs.o
 OBJS += passes/cmds/sta.o
 OBJS += passes/cmds/clean_zerowidth.o
+OBJS += passes/cmds/hello.o
 OBJS += passes/cmds/xprop.o
