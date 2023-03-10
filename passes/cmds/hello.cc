@@ -2106,7 +2106,7 @@ struct HelloWorldPass : public Pass {
 //                log("design->selected_active_module:%s",design->selected_active_module.c_str());
 //                log("design->top_module()->name:%s",design->top_module()->name.c_str());
                 
-//                 std::ofstream my_log("myStuff/myLog.txt");
+//                 std::ofstream my_log("congestionPrediction/myLog.txt");
 //                for(auto my_modules : design->modules_)
 //		{
 ////			log("\n==>MODULE.first:%s\n",my_modules.first.c_str());
@@ -2230,7 +2230,7 @@ struct HelloWorldPass : public Pass {
                     log("Hello World!---\n");
                     dict<std::string,int> name_to_id; //DGL library requires IDs to be ordered
                     name_to_id.clear();
-                    std::ofstream edges_file("myStuff/DGLedges.csv"), cells_file("myStuff/DGLcells.csv");
+                    std::ofstream edges_file("congestionPrediction/DGLedges.csv"), cells_file("congestionPrediction/DGLcells.csv");
                     edges_file<<"Src,Dst,Weight\n";
                     cells_file<<"Id,Name,HashId,Type,ConnCount\n";int myID=0;//=in_ports_count+1;
                     for( auto cell : my_modules->cells() )
