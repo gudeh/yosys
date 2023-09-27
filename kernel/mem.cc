@@ -451,6 +451,7 @@ void Mem::check() {
 		log_assert(GetSize(port.en) == 1);
 		log_assert(GetSize(port.arst) == 1);
 		log_assert(GetSize(port.srst) == 1);
+		log_assert(GetSize(port.addr) >= port.wide_log2);
 		log_assert(GetSize(port.data) == (width << port.wide_log2));
 		log_assert(GetSize(port.init_value) == (width << port.wide_log2));
 		log_assert(GetSize(port.arst_value) == (width << port.wide_log2));
@@ -484,6 +485,7 @@ void Mem::check() {
 		log_assert(GetSize(port.clk) == 1);
 		log_assert(GetSize(port.en) == (width << port.wide_log2));
 		log_assert(GetSize(port.data) == (width << port.wide_log2));
+		log_assert(GetSize(port.addr) >= port.wide_log2);
 		for (int j = 0; j < port.wide_log2; j++) {
 			log_assert(port.addr[j] == State::S0);
 		}
@@ -1250,12 +1252,12 @@ void Mem::prepare_wr_merge(int idx1, int idx2, FfInitVals *initvals) {
 		// If transparent with only one, emulate it, and remove the collision-X
 		// flag that emulate_transparency will set (to align with the other port).
 		if (rport.transparency_mask[idx1]) {
-			emulate_transparency(i, idx1, initvals);
+			emulate_transparency(idx1, i, initvals);
 			rport.collision_x_mask[idx1] = false;
 			continue;
 		}
 		if (rport.transparency_mask[idx2]) {
-			emulate_transparency(i, idx2, initvals);
+			emulate_transparency(idx2, i, initvals);
 			rport.collision_x_mask[idx2] = false;
 			continue;
 		}

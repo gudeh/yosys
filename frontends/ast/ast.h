@@ -30,6 +30,7 @@
 #define AST_H
 
 #include "kernel/rtlil.h"
+#include "kernel/fmt.h"
 #include <stdint.h>
 #include <set>
 
@@ -250,7 +251,7 @@ namespace AST
 
 		// simplify() creates a simpler AST by unrolling for-loops, expanding generate blocks, etc.
 		// it also sets the id2ast pointers so that identifier lookups are fast in genRTLIL()
-		bool simplify(bool const_fold, bool at_zero, bool in_lvalue, int stage, int width_hint, bool sign_hint, bool in_param);
+		bool simplify(bool const_fold, bool in_lvalue, int stage, int width_hint, bool sign_hint, bool in_param);
 		void replace_result_wire_name_in_function(const std::string &from, const std::string &to);
 		AstNode *readmem(bool is_readmemh, std::string mem_filename, AstNode *memory, int start_addr, int finish_addr, bool unconditional_init);
 		void expand_genblock(const std::string &prefix);
@@ -277,7 +278,9 @@ namespace AST
 		bool replace_variables(std::map<std::string, varinfo_t> &variables, AstNode *fcall, bool must_succeed);
 		AstNode *eval_const_function(AstNode *fcall, bool must_succeed);
 		bool is_simple_const_expr();
-		std::string process_format_str(const std::string &sformat, int next_arg, int stage, int width_hint, bool sign_hint);
+
+		// helper for parsing format strings
+		Fmt processFormat(int stage, bool sformat_like, int default_base = 10, size_t first_arg_at = 0);
 
 		bool is_recursive_function() const;
 		std::pair<AstNode*, AstNode*> get_tern_choice();
@@ -335,6 +338,13 @@ namespace AST
 
 		// Helper for looking up identifiers which are prefixed with the current module name
 		std::string try_pop_module_prefix() const;
+
+		// helper to clone the node with some of its subexpressions replaced with zero (this is used
+		// to evaluate widths of dynamic ranges)
+		AstNode *clone_at_zero();
+
+		// helper to print errors from simplify/genrtlil code
+		[[noreturn]] void input_error(const char *format, ...) const YS_ATTRIBUTE(format(printf, 2, 3));
 	};
 
 	// process an AST tree (ast must point to an AST_DESIGN node) and generate RTLIL code
@@ -380,6 +390,7 @@ namespace AST
 
 	// struct helper exposed from simplify for genrtlil
 	AstNode *make_struct_member_range(AstNode *node, AstNode *member_node);
+	AstNode *get_struct_member(const AstNode *node);
 
 	// generate standard $paramod... derived module name; parameters should be
 	// in the order they are declared in the instantiated module

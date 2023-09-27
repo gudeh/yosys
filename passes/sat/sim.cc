@@ -25,6 +25,7 @@
 #include "kernel/ff.h"
 #include "kernel/yw.h"
 #include "kernel/json.h"
+#include "kernel/fmt.h"
 
 #include <ctime>
 
@@ -109,6 +110,7 @@ struct SimShared
 	int next_output_id = 0;
 	int step = 0;
 	std::vector<TriggeredAssertion> triggered_assertions;
+	bool serious_asserts = false;
 };
 
 void zinit(State &v)
@@ -140,6 +142,7 @@ struct SimInstance
 	dict<SigBit, pool<Wire*>> upd_outports;
 
 	dict<SigBit, SigBit> in_parent_drivers;
+	dict<SigBit, SigBit> clk2fflogic_drivers;
 
 	pool<SigBit> dirty_bits;
 	pool<Cell*> dirty_cells;
@@ -167,11 +170,38 @@ struct SimInstance
 		Const data;
 	};
 
+	struct print_state_t
+	{
+		Const past_trg;
+		Const past_en;
+		Const past_args;
+
+		Cell *cell;
+		Fmt fmt;
+
+		std::tuple<bool, SigSpec, Const, int, Cell*> _sort_label() const
+		{
+			return std::make_tuple(
+				cell->getParam(ID::TRG_ENABLE).as_bool(), // Group by trigger
+				cell->getPort(ID::TRG),
+				cell->getParam(ID::TRG_POLARITY),
+				-cell->getParam(ID::PRIORITY).as_int(), // Then sort by descending PRIORITY
+				cell
+			);
+		}
+
+		bool operator<(const print_state_t &other) const
+		{
+			return _sort_label() < other._sort_label();
+		}
+	};
+
 	dict<Cell*, ff_state_t> ff_database;
 	dict<IdString, mem_state_t> mem_database;
 	pool<Cell*> formal_database;
 	pool<Cell*> initstate_database;
 	dict<Cell*, IdString> mem_cells;
+	std::vector<print_state_t> print_database;
 
 	std::vector<Mem> memories;
 
@@ -186,6 +216,10 @@ struct SimInstance
 			shared(shared), scope(scope), module(module), instance(instance), parent(parent), sigmap(module)
 	{
 		log_assert(module);
+
+		if (module->get_blackbox_attribute(true))
+			log_error("Cannot simulate blackbox module %s (instanced at %s).\n",
+					  log_id(module->name), hiername().c_str());
 
 		if (parent) {
 			log_assert(parent->children.count(instance) == 0);
@@ -223,7 +257,8 @@ struct SimInstance
 
 			if (wire->port_input && instance != nullptr && parent != nullptr) {
 				for (int i = 0; i < GetSize(sig); i++) {
-					in_parent_drivers.emplace(sig[i], parent->sigmap(instance->getPort(wire->name)[i]));
+					if (instance->hasPort(wire->name))
+						in_parent_drivers.emplace(sig[i], parent->sigmap(instance->getPort(wire->name)[i]));
 				}
 			}
 		}
@@ -269,6 +304,11 @@ struct SimInstance
 				ff.past_srst = State::Sx;
 				ff.data = ff_data;
 				ff_database[cell] = ff;
+
+				if (cell->get_bool_attribute(ID(clk2fflogic))) {
+					for (int i = 0; i < ff_data.width; i++)
+						clk2fflogic_drivers.emplace(sigmap(ff_data.sig_d[i]), sigmap(ff_data.sig_q[i]));
+				}
 			}
 
 			if (cell->is_mem_cell())
@@ -278,12 +318,25 @@ struct SimInstance
 				if (shared->fst)
 					fst_memories[name] = shared->fst->getMemoryHandles(scope + "." + RTLIL::unescape_id(name));
 			}
-			if (cell->type.in(ID($assert), ID($cover), ID($assume))) {
+
+			if (cell->type.in(ID($assert), ID($cover), ID($assume)))
 				formal_database.insert(cell);
-			}
+
 			if (cell->type == ID($initstate))
 				initstate_database.insert(cell);
+
+			if (cell->type == ID($print)) {
+				print_database.emplace_back();
+				auto &print = print_database.back();
+				print.cell = cell;
+				print.fmt.parse_rtlil(cell);
+				print.past_trg = Const(State::Sx, cell->getPort(ID::TRG).size());
+				print.past_args = Const(State::Sx, cell->getPort(ID::ARGS).size());
+				print.past_en = State::Sx;
+			}
 		}
+
+		std::sort(print_database.begin(), print_database.end());
 
 		if (shared->zinit)
 		{
@@ -387,6 +440,10 @@ struct SimInstance
 		for (int i = 0; i < GetSize(sig); i++) {
 			auto sigbit = sig[i];
 			auto sigval = value[i];
+
+			auto clk2fflogic_driver = clk2fflogic_drivers.find(sigbit);
+			if (clk2fflogic_driver != clk2fflogic_drivers.end())
+				sigbit = clk2fflogic_driver->second;
 
 			auto in_parent_driver = in_parent_drivers.find(sigbit);
 			if (in_parent_driver == in_parent_drivers.end())
@@ -504,6 +561,9 @@ struct SimInstance
 			return;
 		}
 
+		if (cell->type == ID($print))
+			return;
+
 		log_error("Unsupported cell type: %s (%s.%s)\n", log_id(cell->type), log_id(module), log_id(cell));
 	}
 
@@ -588,7 +648,7 @@ struct SimInstance
 		}
 	}
 
-	bool update_ph2(bool gclk)
+	bool update_ph2(bool gclk, bool stable_past_update = false)
 	{
 		bool did_something = false;
 
@@ -599,7 +659,7 @@ struct SimInstance
 
 			Const current_q = get_state(ff.data.sig_q);
 
-			if (ff_data.has_clk) {
+			if (ff_data.has_clk && !stable_past_update) {
 				// flip-flops
 				State current_clk = get_state(ff_data.sig_clk)[0];
 				if (ff_data.pol_clk ? (ff.past_clk == State::S0 && current_clk != State::S0) :
@@ -620,7 +680,7 @@ struct SimInstance
 			if (ff_data.has_aload) {
 				State current_aload = get_state(ff_data.sig_aload)[0];
 				if (current_aload == (ff_data.pol_aload ? State::S1 : State::S0)) {
-					current_q = ff_data.has_clk ? ff.past_ad : get_state(ff.data.sig_ad);
+					current_q = ff_data.has_clk && !stable_past_update ? ff.past_ad : get_state(ff.data.sig_ad);
 				}
 			}
 			// async reset
@@ -671,6 +731,8 @@ struct SimInstance
 				}
 				else
 				{
+					if (stable_past_update)
+						continue;
 					if (port.clk_polarity ?
 							(mdb.past_wr_clk[port_idx] == State::S1 || get_state(port.clk) != State::S1) :
 							(mdb.past_wr_clk[port_idx] == State::S0 || get_state(port.clk) != State::S0))
@@ -700,7 +762,7 @@ struct SimInstance
 		}
 
 		for (auto it : children)
-			if (it.second->update_ph2(gclk)) {
+			if (it.second->update_ph2(gclk, stable_past_update)) {
 				dirty_children.insert(it.second);
 				did_something = true;
 			}
@@ -743,6 +805,50 @@ struct SimInstance
 			}
 		}
 
+		// Do prints *before* assertions
+		for (auto &print : print_database) {
+			Cell *cell = print.cell;
+			bool triggered = false;
+
+			Const trg = get_state(cell->getPort(ID::TRG));
+			Const en = get_state(cell->getPort(ID::EN));
+			Const args = get_state(cell->getPort(ID::ARGS));
+
+			if (!en.as_bool())
+				goto update_print;
+
+			if (cell->getParam(ID::TRG_ENABLE).as_bool()) {
+				Const trg_pol = cell->getParam(ID::TRG_POLARITY);
+				for (int i = 0; i < trg.size(); i++) {
+					bool pol = trg_pol[i] == State::S1;
+					State curr = trg[i], past = print.past_trg[i];
+					if (pol && curr == State::S1 && past == State::S0)
+						triggered = true;
+					if (!pol && curr == State::S0 && past == State::S1)
+						triggered = true;
+				}
+			} else {
+				if (args != print.past_args || en != print.past_en)
+					triggered = true;
+			}
+
+			if (triggered) {
+				int pos = 0;
+				for (auto &part : print.fmt.parts) {
+					part.sig = args.extract(pos, part.sig.size());
+					pos += part.sig.size();
+				}
+
+				std::string rendered = print.fmt.render();
+				log("%s", rendered.c_str());
+			}
+
+		update_print:
+			print.past_trg = trg;
+			print.past_en = en;
+			print.past_args = args;
+		}
+
 		if (check_assertions)
 		{
 			for (auto cell : formal_database)
@@ -764,8 +870,12 @@ struct SimInstance
 				if (cell->type == ID($assume) && en == State::S1 && a != State::S1)
 					log("Assumption %s.%s (%s) failed.\n", hiername().c_str(), log_id(cell), label.c_str());
 
-				if (cell->type == ID($assert) && en == State::S1 && a != State::S1)
-					log_warning("Assert %s.%s (%s) failed.\n", hiername().c_str(), log_id(cell), label.c_str());
+				if (cell->type == ID($assert) && en == State::S1 && a != State::S1) {
+					if (shared->serious_asserts)
+						log_error("Assert %s.%s (%s) failed.\n", hiername().c_str(), log_id(cell), label.c_str());
+					else
+						log_warning("Assert %s.%s (%s) failed.\n", hiername().c_str(), log_id(cell), label.c_str());
+				}
 			}
 		}
 
@@ -1162,6 +1272,11 @@ struct SimWorker : SimShared
 		}
 		for(auto& writer : outputfiles)
 			writer->write(use_signal);
+		
+		if (writeback) {
+			pool<Module*> wbmods;
+			top->writeback(wbmods);
+		}
 	}
 
 	void update(bool gclk)
@@ -1191,9 +1306,21 @@ struct SimWorker : SimShared
 
 	void initialize_stable_past()
 	{
-		if (debug)
-			log("\n-- ph1 (initialize) --\n");
-		top->update_ph1();
+
+		while (1)
+		{
+			if (debug)
+				log("\n-- ph1 (initialize) --\n");
+
+			top->update_ph1();
+
+			if (debug)
+				log("\n-- ph2 (initialize) --\n");
+
+			if (!top->update_ph2(false, true))
+				break;
+		}
+
 		if (debug)
 			log("\n-- ph3 (initialize) --\n");
 		top->update_ph3(true);
@@ -1265,11 +1392,6 @@ struct SimWorker : SimShared
 		register_output_step(10*numcycles + 2);
 
 		write_output_files();
-
-		if (writeback) {
-			pool<Module*> wbmods;
-			top->writeback(wbmods);
-		}
 	}
 
 	void run_cosim_fst(Module *topmod, int numcycles)
@@ -1394,11 +1516,6 @@ struct SimWorker : SimShared
 		}
 
 		write_output_files();
-
-		if (writeback) {
-			pool<Module*> wbmods;
-			top->writeback(wbmods);
-		}
 		delete fst;
 	}
 
@@ -2473,6 +2590,10 @@ struct SimPass : public Pass {
 		log("    -sim-gate\n");
 		log("        co-simulation, x in FST can match any value in simulation\n");
 		log("\n");
+		log("    -assert\n");
+		log("        fail the simulation command if, in the course of simulating,\n");
+		log("        any of the asserts in the design fail\n");
+		log("\n");
 		log("    -q\n");
 		log("        disable per-cycle/sample log message\n");
 		log("\n");
@@ -2625,6 +2746,10 @@ struct SimPass : public Pass {
 			}
 			if (args[argidx] == "-sim-gate") {
 				worker.sim_mode = SimulationMode::gate;
+				continue;
+			}
+			if (args[argidx] == "-assert") {
+				worker.serious_asserts = true;
 				continue;
 			}
 			if (args[argidx] == "-x") {

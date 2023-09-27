@@ -127,9 +127,14 @@ bool clk_polarity, en_polarity, arst_polarity, srst_polarity;
 RTLIL::SigSpec clk_sig, en_sig, arst_sig, srst_sig;
 dict<int, std::string> pi_map, po_map;
 
+int undef_bits_lost;
+
 int map_signal(RTLIL::SigBit bit, gate_type_t gate_type = G(NONE), int in1 = -1, int in2 = -1, int in3 = -1, int in4 = -1)
 {
 	assign_map.apply(bit);
+
+	if (bit == State::Sx)
+		undef_bits_lost++;
 
 	if (signal_map.count(bit) == 0) {
 		gate_t gate;
@@ -702,7 +707,7 @@ void abc_module(RTLIL::Design *design, RTLIL::Module *current_module, std::strin
 		std::vector<std::string> &liberty_files, std::vector<std::string> &genlib_files, std::string constr_file,
 		bool cleanup, vector<int> lut_costs, bool dff_mode, std::string clk_str, bool keepff, std::string delay_target,
 		std::string sop_inputs, std::string sop_products, std::string lutin_shared, bool fast_mode,
-		const std::vector<RTLIL::Cell*> &cells, bool show_tempdir, bool sop_mode, bool abc_dress)
+		const std::vector<RTLIL::Cell*> &cells, bool show_tempdir, bool sop_mode, bool abc_dress, std::vector<std::string> &dont_use_cells)
 {
 	module = current_module;
 	map_autoidx = autoidx++;
@@ -795,8 +800,13 @@ void abc_module(RTLIL::Design *design, RTLIL::Module *current_module, std::strin
 	std::string abc_script = stringf("read_blif \"%s/input.blif\"; ", tempdir_name.c_str());
 
 	if (!liberty_files.empty() || !genlib_files.empty()) {
-		for (std::string liberty_file : liberty_files)
-			abc_script += stringf("read_lib -w \"%s\"; ", liberty_file.c_str());
+		std::string dont_use_args;
+		for (std::string dont_use_cell : dont_use_cells) {
+			dont_use_args += stringf("-X \"%s\" ", dont_use_cell.c_str());
+		}
+		for (std::string liberty_file : liberty_files) {
+			abc_script += stringf("read_lib %s -w \"%s\" ; ", dont_use_args.c_str(), liberty_file.c_str());
+		}
 		for (std::string liberty_file : genlib_files)
 			abc_script += stringf("read_library \"%s\"; ", liberty_file.c_str());
 		if (!constr_file.empty())
@@ -880,9 +890,14 @@ void abc_module(RTLIL::Design *design, RTLIL::Module *current_module, std::strin
 		}
 	}
 
+	undef_bits_lost = 0;
+
 	had_init = false;
 	for (auto c : cells)
 		extract_cell(c, keepff);
+
+	if (undef_bits_lost)
+		log("Replacing %d occurrences of constant undef bits with constant zero bits\n", undef_bits_lost);
 
 	for (auto wire : module->wires()) {
 		if (wire->port_id > 0 || wire->get_bool_attribute(ID::keep))
@@ -1095,6 +1110,24 @@ void abc_module(RTLIL::Design *design, RTLIL::Module *current_module, std::strin
 		abc_output_filter filt(tempdir_name, show_tempdir);
 		int ret = run_command(buffer, std::bind(&abc_output_filter::next_line, filt, std::placeholders::_1));
 #else
+		string temp_stdouterr_name = stringf("%s/stdouterr.txt", tempdir_name.c_str());
+		FILE *temp_stdouterr_w = fopen(temp_stdouterr_name.c_str(), "w");
+		if (temp_stdouterr_w == NULL)
+			log_error("ABC: cannot open a temporary file for output redirection");
+		fflush(stdout);
+		fflush(stderr);
+		FILE *old_stdout = fopen(temp_stdouterr_name.c_str(), "r"); // need any fd for renumbering
+		FILE *old_stderr = fopen(temp_stdouterr_name.c_str(), "r"); // need any fd for renumbering
+#if defined(__wasm)
+#define fd_renumber(from, to) (void)__wasi_fd_renumber(from, to)
+#else
+#define fd_renumber(from, to) dup2(from, to)
+#endif
+		fd_renumber(fileno(stdout), fileno(old_stdout));
+		fd_renumber(fileno(stderr), fileno(old_stderr));
+		fd_renumber(fileno(temp_stdouterr_w), fileno(stdout));
+		fd_renumber(fileno(temp_stdouterr_w), fileno(stderr));
+		fclose(temp_stdouterr_w);
 		// These needs to be mutable, supposedly due to getopt
 		char *abc_argv[5];
 		string tmp_script_name = stringf("%s/abc.script", tempdir_name.c_str());
@@ -1108,6 +1141,17 @@ void abc_module(RTLIL::Design *design, RTLIL::Module *current_module, std::strin
 		free(abc_argv[1]);
 		free(abc_argv[2]);
 		free(abc_argv[3]);
+		fflush(stdout);
+		fflush(stderr);
+		fd_renumber(fileno(old_stdout), fileno(stdout));
+		fd_renumber(fileno(old_stderr), fileno(stderr));
+		fclose(old_stdout);
+		fclose(old_stderr);
+		std::ifstream temp_stdouterr_r(temp_stdouterr_name);
+		abc_output_filter filt(tempdir_name, show_tempdir);
+		for (std::string line; std::getline(temp_stdouterr_r, line); )
+			filt.next_line(line + "\n");
+		temp_stdouterr_r.close();
 #endif
 		if (ret != 0)
 			log_error("ABC: execution of command \"%s\" failed: return code %d.\n", buffer.c_str(), ret);
@@ -1474,6 +1518,10 @@ struct AbcPass : public Pass {
 		log("        generate netlists for the specified cell library (using the liberty\n");
 		log("        file format).\n");
 		log("\n");
+		log("    -dont_use <cell_name>\n");
+		log("        generate netlists for the specified cell library (using the liberty\n");
+		log("        file format).\n");
+		log("\n");
 		log("    -genlib <file>\n");
 		log("        generate netlists for the specified cell library (using the SIS Genlib\n");
 		log("        file format).\n");
@@ -1610,7 +1658,7 @@ struct AbcPass : public Pass {
 
 		std::string exe_file = yosys_abc_executable;
 		std::string script_file, default_liberty_file, constr_file, clk_str;
-		std::vector<std::string> liberty_files, genlib_files;
+		std::vector<std::string> liberty_files, genlib_files, dont_use_cells;
 		std::string delay_target, sop_inputs, sop_products, lutin_shared = "-S 1";
 		bool fast_mode = false, dff_mode = false, keepff = false, cleanup = true;
 		bool show_tempdir = false, sop_mode = false;
@@ -1691,6 +1739,10 @@ struct AbcPass : public Pass {
 			}
 			if (arg == "-liberty" && argidx+1 < args.size()) {
 				liberty_files.push_back(args[++argidx]);
+				continue;
+			}
+			if (arg == "-dont_use" && argidx+1 < args.size()) {
+				dont_use_cells.push_back(args[++argidx]);
 				continue;
 			}
 			if (arg == "-genlib" && argidx+1 < args.size()) {
@@ -1999,7 +2051,7 @@ struct AbcPass : public Pass {
 
 			if (!dff_mode || !clk_str.empty()) {
 				abc_module(design, mod, script_file, exe_file, liberty_files, genlib_files, constr_file, cleanup, lut_costs, dff_mode, clk_str, keepff,
-						delay_target, sop_inputs, sop_products, lutin_shared, fast_mode, mod->selected_cells(), show_tempdir, sop_mode, abc_dress);
+						delay_target, sop_inputs, sop_products, lutin_shared, fast_mode, mod->selected_cells(), show_tempdir, sop_mode, abc_dress, dont_use_cells);
 				continue;
 			}
 
@@ -2161,7 +2213,7 @@ struct AbcPass : public Pass {
 				srst_polarity = std::get<6>(it.first);
 				srst_sig = assign_map(std::get<7>(it.first));
 				abc_module(design, mod, script_file, exe_file, liberty_files, genlib_files, constr_file, cleanup, lut_costs, !clk_sig.empty(), "$",
-						keepff, delay_target, sop_inputs, sop_products, lutin_shared, fast_mode, it.second, show_tempdir, sop_mode, abc_dress);
+						keepff, delay_target, sop_inputs, sop_products, lutin_shared, fast_mode, it.second, show_tempdir, sop_mode, abc_dress, dont_use_cells);
 				assign_map.set(mod);
 			}
 		}
